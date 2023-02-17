@@ -1,0 +1,111 @@
+name: Test Sealos CMD
+env:
+  # Common versions
+  GO_VERSION: "1.20"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "*" ]
+#    paths:
+#      - "controllers/metering/**"
+#      - ".github/workflows/e2e_metering.yml"
+#      - "!**/*.md"
+#      - "!**/*.yaml"
+
+jobs:
+  install-infra:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Auto install sealos
+        uses: labring/sealos-action@v0.0.4
+        with:
+          type: install-dev
+          sealosGit: https://github.com/labring/sealos.git
+          sealosGitBranch: main
+          goAddr: https://go.dev/dl/go1.20.linux-amd64.tar.gz
+          pruneCRI: true
+      - name: Auto install k8s using sealos
+        uses: labring/sealos-action@v0.0.2
+        with:
+          image: labring/kubernetes:v1.25.0 labring/helm:v3.8.2 labring/calico:v3.24.1
+          debug: true
+          type: run-k8s
+      - name: After k8s operation
+        run: |
+          mkdir -p $HOME/.kube
+          sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+          sudo chown $(id -u):$(id -g) $HOME/.kube/config
+          NODENAME=$(sudo -u root kubectl get nodes -ojsonpath='{.items[0].metadata.name}' )
+          NODEIP=$(sudo -u root kubectl get nodes -ojsonpath='{.items[0].status.addresses[0].address}' )
+          echo "NodeName=$NODENAME,NodeIP=$NODEIP"
+          
+          sleep 30
+          sudo -u root crictl ps -a
+          sudo -u root systemctl status kubelet
+          sudo -u root kubectl get nodes 
+          sudo -u root kubectl get pods -A
+      - name: install-CRD-infra-and-apply-infra-CR
+        working-directory: ./controllers/infra
+        run: |
+          kubectl create namespace infra-system
+          sudo -u root kubectl create secret generic infra-secret -n infra-system --from-literal=AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} --from-literal=AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} --from-literal=AWS_DEFAULT_REGION=${{ secrets.AWS_DEFAULT_REGION }}
+          make pre-deploy
+          sudo -u root kubectl apply -f ./deploy/manifests/deploy.yaml 
+          sudo -u root kubectl apply -f ./config/samples/infra_v1_e2etest.yaml                                            
+          sleep 90                                                                                                       
+          sudo -u root kubectl get infra -A -o yaml  
+          kubectl get pod -A
+          sudo -u root kubectl get pod -n infra-system|grep infra |awk '{print $1}' |xargs kubectl logs -n infra-system
+
+      # sure infra is delete whether ci success or fail
+      - uses: webiny/action-post-run@3.0.0
+        id: post-run-command
+        with:
+          run: kubectl delete infra e2e-test
+      - name: Install SSH Key
+        uses: shimataro/ssh-key-action@v2
+        with:
+          key: $(cat ssh.pk)
+          known_hosts: $masterPublicIP
+      - name: Install sealos in remote complete
+        run: |
+          sudo -u root kubectl get infra e2e-test -o jsonpath='{.spec.ssh.pkData}' > ssh.pk
+          sudo -u root chmod 0400 ssh.pk
+          cat ssh.pk
+          masterPublicIP=$(sudo -u root kubectl get infra e2e-test -o jsonpath='{.spec.hosts[0].metadata[0].ipaddress[1].ipValue}') 
+          nodePublicIP=$(sudo -u root kubectl get infra e2e-test -o jsonpath='{.spec.hosts[1].metadata[0].ipaddress[1].ipValue}')
+          echo $masterPublicIP
+          mv ssh.pk ~/.ssh/id_rsa
+          sudo -u root ssh-keyscan  $masterPublicIP >> ~/.ssh/known_hosts
+          ssh root@$masterPublicIP "ls -al /root"
+          ssh root@$masterPublicIP "sudo -u root chmod 777 /usr/local/bin"
+          ssh root@$nodePublicIP "sudo -u root chmod 777 /usr/local/bin"
+          sudo -u root scp -r  /usr/local/bin/sealos root@masterPublicIP:/usr/local/bin/
+          sudo -u root scp -r  /usr/local/bin/sealos root@nodePublicIP:/usr/local/bin/
+          ssh root@$masterPublicIP "sealos version"
+      - name: install k8s
+        run: |
+          masterPublicIP=$(sudo -u root kubectl get infra e2e-test -o jsonpath='{.spec.hosts[0].metadata[0].ipaddress[1].ipValue}') 
+          masterPrivateIP=$(sudo -u root kubectl get infra e2e-test -o jsonpath='{.spec.hosts[0].metadata[0].ipaddress[0].ipValue}') 
+          nodePrivateIP=$(sudo -u root kubectl get infra e2e-test -o jsonpath='{.spec.hosts[1].metadata[0].ipaddress[0].ipValue}')
+          ssh  root@$masterPublicIP "sealos run labring/kubernetes:v1.25.0 labring/helm:v3.8.2 labring/calico:v3.24.1 --masters $masterPrivateIP --nodes nodePrivateIP"
+          sleep 30
+          ssh  root@$masterPublicIP "sudo -u root kubectl get nodes && kubectl get pod -A"
+      - name: verify sealos cmd add and delete
+        run: |
+          masterPublicIP=$(sudo -u root kubectl get infra e2e-test -o jsonpath='{.spec.hosts[0].metadata[0].ipaddress[1].ipValue}') 
+          nodePrivateIP=$(sudo -u root kubectl get infra e2e-test -o jsonpath='{.spec.hosts[1].metadata[0].ipaddress[0].ipValue}')
+          ssh  root@$masterPublicIP "sealos version"
+          ssh root@$masterPublicIP "sudo -u root sealos delete --nodes $nodePrivateIP"
+          sleep 20
+          ssh -i ssh.pk root@$masterPublicIP "sudo -u root kubectl get nodes"
+          ssh -i ssh.pk root@$masterPublicIP "sudo -u root sealos add --nodes $nodePrivateIP"
+          sleep 20          
+          ssh -i ssh.pk root@$masterPublicIP "sudo -u root kubectl get nodes"
+
+
+
